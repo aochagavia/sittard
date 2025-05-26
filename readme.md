@@ -34,11 +34,12 @@ See [`sittard/examples`](./sittard/examples/) for more.
 
 ## But why?
 
-Sittard was born out of the need to simulate QUIC network traffic in deep space, where the delay
-between nodes goes from a few minutes (e.g. Earth-Mars) to longer than a day (e.g. Earth-Voyager).
-Running these simulations in a traditional way would require long waits, potentially multiple days!
-Fortunately, with sittard we can run thousands of simulated hours in mere seconds. An additional
-bonus is that deterministic execution ensures reproducible results across runs.
+Sittard was born out of the need to [simulate QUIC network traffic in deep
+space](https://github.com/aochagavia/quinn-workbench), where the delay between nodes goes from a few
+minutes (e.g. Earth-Mars) to longer than a day (e.g. Earth-Voyager). Running these simulations in a
+traditional way would require long waits, potentially multiple days! Fortunately, with sittard we
+can run thousands of simulated hours in mere seconds. An additional bonus is that deterministic
+execution ensures reproducible results across runs.
 
 Note that sittard is unsuitable for common async scenarios, such as programming a web server or
 accessing an API over a network.
