@@ -256,13 +256,13 @@ mod test {
 
         rt.block_on(async {
             let flag_clone = inner_task_completed.clone();
-            spawn(Box::pin(async move {
+            spawn(async move {
                 sleep(Duration::from_millis(50)).await;
-                spawn(Box::pin(async move {
+                spawn(async move {
                     sleep(Duration::from_millis(50)).await;
                     flag_clone.store(true, Ordering::SeqCst);
-                }));
-            }));
+                });
+            });
 
             // Wait for inner task to complete
             sleep(Duration::from_millis(101)).await;
@@ -410,5 +410,122 @@ mod test {
             MAX_WAKES + 1,
             "Task was not polled the expected number of times"
         );
+    }
+
+    #[test]
+    fn test_join_multiple_tasks() {
+        let rt = Runtime::default();
+        let results = rt.block_on(async {
+            let handle1 = spawn(async {
+                sleep(Duration::from_millis(50)).await;
+                1
+            });
+
+            let handle2 = spawn(async {
+                sleep(Duration::from_millis(100)).await;
+                2
+            });
+
+            let handle3 = spawn(async {
+                sleep(Duration::from_millis(25)).await;
+                3
+            });
+
+            let (r1, r2, r3) = futures::join!(handle1, handle2, handle3);
+            (r1.unwrap(), r2.unwrap(), r3.unwrap())
+        });
+
+        assert_eq!(results, (1, 2, 3));
+    }
+
+    #[test]
+    fn test_task_and_timer_race() {
+        let rt = Runtime::default();
+        let result = rt.block_on(async {
+            let task_handle = spawn(async {
+                sleep(Duration::from_millis(75)).await;
+                "task"
+            });
+
+            futures::select_biased! {
+                task_result = task_handle.fuse() => {
+                    task_result.unwrap()
+                },
+                _ = sleep(Duration::from_millis(100)).fuse() => {
+                    "timer"
+                },
+            }
+        });
+
+        assert_eq!(result, "task");
+    }
+
+    #[test]
+    fn test_channel_communication() {
+        let rt = Runtime::default();
+        let result = rt.block_on(async {
+            let (mut tx, mut rx) = futures::channel::mpsc::channel::<i32>(10);
+
+            spawn(async move {
+                for i in 0..5 {
+                    sleep(Duration::from_millis(10)).await;
+                    tx.send(i).await.unwrap();
+                }
+            });
+
+            let mut sum = 0;
+            while let Some(value) = rx.next().await {
+                sum += value;
+            }
+
+            sum
+        });
+
+        // 0 + 1 + 2 + 3 + 4 = 10
+        assert_eq!(result, 10);
+    }
+
+    #[test]
+    fn test_oneshot_channel() {
+        let rt = Runtime::default();
+        let result = rt.block_on(async {
+            let (tx, rx) = futures::channel::oneshot::channel();
+
+            spawn(async move {
+                sleep(Duration::from_millis(50)).await;
+                tx.send("hello from spawned task").unwrap();
+            });
+
+            rx.await.unwrap()
+        });
+
+        assert_eq!(result, "hello from spawned task");
+    }
+
+    #[test]
+    fn test_select_with_channels_and_timers() {
+        let rt = Runtime::default();
+        let result = rt.block_on(async {
+            let (mut tx, mut rx) = futures::channel::mpsc::channel::<&str>(1);
+
+            spawn(async move {
+                sleep(Duration::from_millis(75)).await;
+                tx.send("channel message").await.unwrap();
+            });
+
+            futures::select_biased! {
+                msg = rx.next().fuse() => {
+                    msg.unwrap()
+                },
+                _ = sleep(Duration::from_millis(100)).fuse() => {
+                    "slow fired"
+                },
+                _ = sleep(Duration::from_millis(50)).fuse() => {
+                    "fast timer"
+                },
+            }
+        });
+
+        assert_eq!(result, "fast timer");
     }
 }
