@@ -1,6 +1,11 @@
 Sittard
 =======
 
+[![Documentation](https://docs.rs/sittard/badge.svg)](https://docs.rs/sittard/)
+[![Crates.io](https://img.shields.io/crates/v/sittard.svg)](https://crates.io/crates/sittard)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE-MIT)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE-APACHE)
+
 A **S**ans-**I**O **t**ickless **a**sync **r**untime, fully **d**eterministic.
 
 That's a mouthful, so let's unpack it:
