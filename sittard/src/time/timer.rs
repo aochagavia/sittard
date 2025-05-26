@@ -88,13 +88,13 @@ impl Debug for Timer {
     }
 }
 
-pub enum PendingTimerHandlerEnum {
+pub(crate) enum PendingTimerHandlerEnum {
     WakeWaitingTasks,
     Ignore,
     CancelWaitingTasks,
 }
 
-pub struct PendingTimerHandler(AtomicU64);
+pub(crate) struct PendingTimerHandler(AtomicU64);
 
 impl PendingTimerHandler {
     pub fn wake_waiting_tasks() -> Self {
@@ -119,7 +119,7 @@ impl PendingTimerHandler {
     }
 }
 
-pub struct PendingTimer {
+pub(crate) struct PendingTimer {
     pub(crate) timer_id: u64,
     pub(crate) elapsed_at: StdInstant,
     pub(crate) handler: PendingTimerHandler,

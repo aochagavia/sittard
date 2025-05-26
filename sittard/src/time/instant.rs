@@ -16,8 +16,12 @@ impl Instant {
         Self::now().0 - self.0
     }
 
-    pub fn saturating_duration_since(&self, instant: Instant) -> Duration {
-        self.0.saturating_duration_since(instant.0)
+    pub fn from_std(instant: std::time::Instant) -> Self {
+        Self(instant)
+    }
+
+    pub fn into_std(self) -> std::time::Instant {
+        self.0
     }
 }
 
