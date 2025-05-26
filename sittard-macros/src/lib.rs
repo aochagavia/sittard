@@ -30,7 +30,7 @@ pub fn test_priv(
         #[test]
         #vis fn #fn_name() {
             // Initialize runtime and block on the async function
-            let runtime = crate::rt::Rt::default();
+            let runtime = crate::Runtime::default();
             runtime.block_on(async #fn_block)
         }
     };
@@ -66,7 +66,7 @@ pub fn test(
         #[test]
         #vis fn #fn_name() {
             // Initialize runtime and block on the async function
-            let runtime = sittard::rt::Rt::default();
+            let runtime = sittard::Runtime::default();
             runtime.block_on(async #fn_block)
         }
     };

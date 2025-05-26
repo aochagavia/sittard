@@ -13,15 +13,15 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant as StdInstant};
 
 thread_local! {
-    static ACTIVE_RT: RefCell<Option<Rt>> = const { RefCell::new(None) };
+    static ACTIVE_RT: RefCell<Option<Runtime >> = const { RefCell::new(None) };
 }
 
 #[derive(Clone)]
-pub struct Rt {
-    inner: Rc<RtInner>,
+pub struct Runtime {
+    inner: Rc<RuntimeInner>,
 }
 
-pub(crate) struct RtInner {
+pub(crate) struct RuntimeInner {
     // Time-keeping
     pub(crate) clock: RuntimeClock,
     pub(crate) advance_clock: Box<dyn AdvanceClock>,
@@ -36,7 +36,7 @@ pub(crate) struct RtInner {
     blocked_tasks_by_id: RefCell<HashMap<u64, Task>>,
 }
 
-impl RtInner {
+impl RuntimeInner {
     pub(crate) fn get_next_id(&self) -> u64 {
         let next_id = self.next_task_id.get();
         self.next_task_id.set(next_id + 1);
@@ -44,23 +44,23 @@ impl RtInner {
     }
 }
 
-impl Debug for Rt {
+impl Debug for Runtime {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "Rt")
     }
 }
 
-impl Default for Rt {
+impl Default for Runtime {
     fn default() -> Self {
         Self::new(Box::new(AdvanceToNextWake))
     }
 }
 
-impl Rt {
+impl Runtime {
     pub fn new(advance_clock: Box<dyn AdvanceClock>) -> Self {
         let now = StdInstant::now();
         Self {
-            inner: Rc::new(RtInner {
+            inner: Rc::new(RuntimeInner {
                 clock: RuntimeClock {
                     now: Arc::new(Mutex::new(now)),
                 },
@@ -95,7 +95,7 @@ impl Rt {
         self.inner.clock.now()
     }
 
-    pub fn active() -> Rt {
+    pub fn active() -> Runtime {
         let maybe_rt = ACTIVE_RT.with_borrow(Option::clone);
         match maybe_rt {
             Some(rt) => rt,
@@ -475,7 +475,7 @@ mod test {
 
     #[test]
     fn test_waiting_timers_ordered_correctly() {
-        let rt = Rt::default();
+        let rt = Runtime::default();
         rt.block_on(async {
             rt.spawn(Box::pin(async move {
                 sleep(Duration::from_secs(5)).await;
@@ -525,7 +525,7 @@ mod test {
 
     #[test]
     fn test_select_timer() {
-        let rt = Rt::default();
+        let rt = Runtime::default();
         rt.block_on(async {
             for _ in 0..100 {
                 let result;
@@ -541,7 +541,7 @@ mod test {
 
     #[test]
     fn test_select_task() {
-        let rt = Rt::default();
+        let rt = Runtime::default();
         rt.block_on(async {
             for _ in 0..100 {
                 let t1 = async {
@@ -565,7 +565,7 @@ mod test {
     #[test]
     #[should_panic]
     fn test_block_on_stuck_panics() {
-        let rt = Rt::default();
+        let rt = Runtime::default();
         rt.block_on(async {
             // A future that never completes and has no timers
             future::pending::<()>().await;
@@ -574,7 +574,7 @@ mod test {
 
     #[test]
     fn test_multiple_spawned_tasks_timer_order() {
-        let rt = Rt::default();
+        let rt = Runtime::default();
         let completion_order = Arc::new(Mutex::new(VecDeque::new()));
 
         rt.block_on(async {
@@ -609,7 +609,7 @@ mod test {
 
     #[test]
     fn test_nested_spawn() {
-        let rt = Rt::default();
+        let rt = Runtime::default();
         let inner_task_completed = Arc::new(AtomicBool::new(false));
 
         rt.block_on(async {
@@ -634,7 +634,7 @@ mod test {
     #[test]
     fn test_many_tasks() {
         const NUM_TASKS: usize = 1000;
-        let rt = Rt::default();
+        let rt = Runtime::default();
         let completed_count = Arc::new(AtomicUsize::new(0));
 
         rt.block_on(async {
@@ -661,7 +661,7 @@ mod test {
     #[test]
     #[should_panic(expected = "Spawned task panicked")]
     fn test_spawned_task_panics() {
-        let rt = Rt::default();
+        let rt = Runtime::default();
         rt.block_on(async {
             rt.spawn(Box::pin(async {
                 sleep(Duration::from_millis(10)).await;
@@ -675,7 +675,7 @@ mod test {
 
     #[test]
     fn test_zero_duration_sleep() {
-        let rt = Rt::default();
+        let rt = Runtime::default();
         let task_completed = Arc::new(AtomicBool::new(false));
         let flag_clone = task_completed.clone();
 
@@ -696,7 +696,7 @@ mod test {
 
     #[test]
     fn test_main_future_completes_before_spawned_tasks() {
-        let rt = Rt::default();
+        let rt = Runtime::default();
         let done_tasks = Arc::new(Mutex::new(Vec::new()));
 
         rt.block_on(async {
@@ -749,7 +749,7 @@ mod test {
 
     #[test]
     fn test_task_repeatedly_wakes_itself() {
-        let rt = Rt::default();
+        let rt = Runtime::default();
         let wakes = Arc::new(AtomicUsize::new(0));
         const MAX_WAKES: usize = 5;
 

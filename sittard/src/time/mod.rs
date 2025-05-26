@@ -1,4 +1,4 @@
-use crate::rt::Rt;
+use crate::rt::Runtime;
 pub use crate::time::instant::Instant;
 use crate::time::timer::Timer;
 use futures::{FutureExt, select_biased};
@@ -10,12 +10,12 @@ pub mod timer;
 
 #[must_use]
 pub fn sleep(duration: Duration) -> Timer {
-    Rt::active().sleep(duration)
+    Runtime::active().sleep(duration)
 }
 
 #[must_use]
 pub fn sleep_until(instant: Instant) -> Timer {
-    Rt::active().sleep_until(instant)
+    Runtime::active().sleep_until(instant)
 }
 
 pub async fn timeout<T>(duration: Duration, future: impl Future<Output = T>) -> Result<T, ()> {

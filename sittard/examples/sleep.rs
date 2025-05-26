@@ -1,9 +1,9 @@
-use sittard::rt::Rt;
+use sittard::Runtime;
 use std::time::Duration;
 
 fn main() {
     // Create a runtime and run a future
-    let rt = Rt::default();
+    let rt = Runtime::default();
     rt.block_on(async move {
         let now = sittard::time::Instant::now();
         sittard::time::sleep(Duration::from_secs(60)).await;

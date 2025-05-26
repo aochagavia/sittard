@@ -1,4 +1,4 @@
-use crate::rt::Rt;
+use crate::rt::Runtime;
 use std::ops::{Add, Sub};
 use std::time::Duration;
 
@@ -8,7 +8,7 @@ pub struct Instant(pub(crate) std::time::Instant);
 
 impl Instant {
     pub fn now() -> Self {
-        let now = Rt::active().now();
+        let now = Runtime::active().now();
         Self(now)
     }
 

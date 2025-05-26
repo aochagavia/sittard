@@ -1,4 +1,4 @@
-use crate::rt::{RtInner, RuntimeClock};
+use crate::rt::{RuntimeClock, RuntimeInner};
 use parking_lot::Mutex;
 use std::cmp::Ordering;
 use std::fmt::{Debug, Formatter};
@@ -17,7 +17,7 @@ pub struct Timer {
 }
 
 impl Timer {
-    pub(crate) fn new(rt: &RtInner, deadline: StdInstant) -> Self {
+    pub(crate) fn new(rt: &RuntimeInner, deadline: StdInstant) -> Self {
         Self {
             id: rt.get_next_id(),
             clock: rt.clock.clone(),

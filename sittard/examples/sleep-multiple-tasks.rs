@@ -1,8 +1,8 @@
-use sittard::rt::Rt;
+use sittard::Runtime;
 use std::time::Duration;
 
 fn main() {
-    let rt = Rt::default();
+    let rt = Runtime::default();
     rt.block_on(async {
         rt.spawn(async move {
             sittard::time::sleep(Duration::from_millis(200)).await;
