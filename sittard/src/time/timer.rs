@@ -9,6 +9,22 @@ use std::sync::atomic::AtomicU64;
 use std::task::{Context, Poll, Waker};
 use std::time::Instant as StdInstant;
 
+/// A future that completes at a specific point in virtual time.
+///
+/// Refer to [`crate::time`] for functions that create instances of `Timer`.
+///
+/// # Example
+///
+/// ```rust
+/// use sittard::{time::sleep, Runtime};
+/// use std::time::Duration;
+///
+/// let rt = Runtime::default();
+/// rt.block_on(async {
+///     let timer = sleep(Duration::from_secs(1));
+///     timer.await; // Completes after 1 second of virtual time
+/// });
+/// ```
 pub struct Timer {
     id: u64,
     clock: RuntimeClock,
@@ -30,6 +46,34 @@ impl Timer {
 }
 
 impl Timer {
+    /// Resets this timer to a new deadline.
+    ///
+    /// This method changes the timer's deadline to the specified instant. If the timer was already
+    /// pending, it will be updated to use the new deadline. The timer can be reset even after it
+    /// completes.
+    ///
+    /// # Parameters
+    ///
+    /// * `deadline` - The new absolute time when the timer should complete
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sittard::{time::{sleep, Instant}, Runtime};
+    /// use std::time::Duration;
+    /// use std::pin::Pin;
+    ///
+    /// let rt = Runtime::default();
+    /// rt.block_on(async {
+    ///     let mut timer = Box::pin(sleep(Duration::from_secs(1)));
+    ///
+    ///     // Reset to a later time
+    ///     let new_deadline = Instant::now() + Duration::from_secs(2);
+    ///     timer.as_mut().reset(new_deadline.into_std());
+    ///
+    ///     timer.await; // Now completes after 2 seconds instead of 1
+    /// });
+    /// ```
     pub fn reset(mut self: Pin<&mut Self>, deadline: StdInstant) {
         // Update timer
         self.deadline = deadline;

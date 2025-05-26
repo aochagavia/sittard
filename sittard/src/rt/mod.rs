@@ -1,6 +1,6 @@
 pub(crate) mod clock;
 pub(crate) mod task;
-mod waker;
+pub(crate) mod waker;
 
 #[cfg(feature = "send")]
 pub(crate) mod send;
@@ -23,6 +23,23 @@ thread_local! {
     static ACTIVE_RT: RefCell<Option<Runtime >> = const { RefCell::new(None) };
 }
 
+/// The main async runtime for sittard.
+///
+/// `Runtime` deterministically executes async tasks. It also keeps virtual time and advances the
+/// clock as needed.
+///
+/// # Example
+///
+/// ```rust
+/// use sittard::Runtime;
+/// use std::time::Duration;
+///
+/// let rt = Runtime::default();
+/// rt.block_on(async {
+///     sittard::time::sleep(Duration::from_secs(1)).await;
+///     println!("One second has passed (virtually)!");
+/// });
+/// ```
 #[derive(Clone)]
 pub struct Runtime {
     inner: Rc<RuntimeInner>,
@@ -64,6 +81,14 @@ impl Default for Runtime {
 }
 
 impl Runtime {
+    /// Creates a new runtime with a custom [`AdvanceClock`] implementation.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sittard::{Runtime, AdvanceToNextWake};
+    /// let rt = Runtime::new(Box::new(AdvanceToNextWake));
+    /// ```
     pub fn new(advance_clock: Box<dyn AdvanceClock>) -> Self {
         let now = StdInstant::now();
         Self {
@@ -83,14 +108,45 @@ impl Runtime {
         }
     }
 
+    /// Creates a new timer that will complete at the specified deadline.
+    ///
+    /// This is a low-level method for creating timers. Most users should prefer the functions in
+    /// the [`crate::time`] module.
     pub fn new_timer(&self, deadline: StdInstant) -> Timer {
         Timer::new(&self.inner, deadline)
     }
 
+    /// Creates a timer that will complete after the specified duration.
+    ///
+    /// This is a low-level method for creating timers. Most users should prefer the functions in
+    /// the [`crate::time`] module.
+    pub fn sleep(&self, duration: Duration) -> Timer {
+        let deadline = self.now() + duration;
+        self.new_timer(deadline)
+    }
+
+    /// Creates a timer that will complete at the specified absolute time.
+    ///
+    /// This is a low-level method for creating timers. Most users should prefer
+    /// the functions in the [`crate::time`] module.
+    pub fn sleep_until(&self, deadline: Instant) -> Timer {
+        self.new_timer(deadline.0)
+    }
+
+    /// Spawns a future as a new task on this runtime.
+    ///
+    /// This is a low-level method for spawning tasks. Most users should prefer the [`crate::spawn`]
+    /// function, which allows you to await tasks and observe their return values.
+    ///
+    /// Note: spawned tasks run concurrently, but not in parallel, with other tasks.
     pub fn spawn<T: Future<Output = ()> + 'static>(&self, future: T) {
         self.spawn_boxed(Box::pin(future))
     }
 
+    /// Spawns a boxed future as a new task on this runtime.
+    ///
+    /// This is a low-level method that accepts an already-boxed future.
+    /// Most users should prefer [`crate::spawn`].
     pub fn spawn_boxed(&self, future: Pin<Box<dyn Future<Output = ()> + 'static>>) {
         self.inner
             .ready_to_poll_tasks
@@ -98,10 +154,22 @@ impl Runtime {
             .push_back(Task { future });
     }
 
+    /// Returns the current virtual time.
+    ///
+    /// This returns the current time according to the runtime's virtual clock,
+    /// which may be different from the real system time.
     pub fn now(&self) -> std::time::Instant {
         self.inner.clock.now()
     }
 
+    /// Returns the currently active runtime.
+    ///
+    /// This function returns the runtime that is currently executing in the current thread.
+    /// It can be used to access the runtime from within async code.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside of a runtime context (i.e., not within `Runtime::block_on`).
     pub fn active() -> Runtime {
         let maybe_rt = ACTIVE_RT.with_borrow(Option::clone);
         match maybe_rt {
@@ -121,15 +189,34 @@ impl Runtime {
         ACTIVE_RT.set(None);
     }
 
-    pub fn sleep(&self, duration: Duration) -> Timer {
-        let deadline = self.now() + duration;
-        self.new_timer(deadline)
-    }
-
-    pub fn sleep_until(&self, deadline: Instant) -> Timer {
-        self.new_timer(deadline.0)
-    }
-
+    /// Runs a future to completion.
+    ///
+    /// This method executes the runtime's event loop, advancing the virtual clock as needed, until
+    /// the provided future completes. It is the main entry point for running async code with
+    /// sittard.
+    ///
+    /// Important: `block_on` will return as soon as the future completes, meaning that any spawned
+    /// tasks will stop being polled (until the next time `block_on` is called).
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - Called from within an already active runtime context.
+    /// - The future is blocked but no progress can be made (i.e. there are no pending timers).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sittard::Runtime;
+    /// use std::time::Duration;
+    ///
+    /// let rt = Runtime::default();
+    /// let result = rt.block_on(async {
+    ///     sittard::time::sleep(Duration::from_secs(1)).await;
+    ///     42
+    /// });
+    /// assert_eq!(result, 42);
+    /// ```
     pub fn block_on<T>(&self, f: impl Future<Output = T>) -> T {
         self.register_active();
 
@@ -320,324 +407,5 @@ impl Runtime {
                 false
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use crate::rt::waker::TaskWaker;
-    use crate::spawn;
-    use crate::test_util::assert_send;
-    use crate::time::{sleep, timeout};
-    use futures::{FutureExt, SinkExt, StreamExt};
-    use parking_lot::Mutex;
-    use std::collections::VecDeque;
-    use std::future::{self, Future};
-    use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::task::{Context, Poll};
-    use std::time::Duration;
-
-    #[test]
-    fn test_waker_is_send() {
-        assert_send::<TaskWaker>();
-    }
-
-    #[test]
-    fn test_waiting_timers_ordered_correctly() {
-        let rt = Runtime::default();
-        rt.block_on(async {
-            rt.spawn(Box::pin(async move {
-                sleep(Duration::from_secs(5)).await;
-            }));
-
-            let now = rt.now();
-            rt.sleep(Duration::from_secs(10)).await;
-            let later = rt.now();
-            assert_eq!(Duration::from_secs(10), later - now);
-        });
-    }
-
-    #[crate::test_priv]
-    async fn test_timeout_elapsed() {
-        let start = Instant::now();
-        let result = timeout(Duration::from_secs(10), async move {
-            sleep(Duration::from_secs(15)).await
-        })
-        .await;
-
-        assert!(result.is_err());
-        assert_eq!(start.elapsed(), Duration::from_secs(10));
-    }
-
-    #[crate::test_priv]
-    async fn test_timeout_not_elapsed() {
-        let start = Instant::now();
-        let result = timeout(Duration::from_secs(10), async move {
-            sleep(Duration::from_secs(5)).await
-        })
-        .await;
-
-        assert!(result.is_ok());
-        assert_eq!(start.elapsed(), Duration::from_secs(5));
-    }
-
-    #[crate::test_priv]
-    async fn test_channels() {
-        let (mut tx, mut rx) = futures::channel::mpsc::channel(42);
-        crate::spawn(async move {
-            tx.send(1234).await.unwrap();
-        });
-
-        let received = rx.next().await.unwrap();
-        assert_eq!(received, 1234);
-    }
-
-    #[test]
-    fn test_select_timer() {
-        let rt = Runtime::default();
-        rt.block_on(async {
-            for _ in 0..100 {
-                let result;
-                futures::select_biased! {
-                    _ = sleep(Duration::from_secs(4)).fuse() => result = Some(42),
-                    _ = sleep(Duration::from_secs(1)).fuse() => result = Some(1234),
-                }
-
-                assert_eq!(result, Some(1234));
-            }
-        });
-    }
-
-    #[test]
-    fn test_select_task() {
-        let rt = Runtime::default();
-        rt.block_on(async {
-            for _ in 0..100 {
-                let t1 = async {
-                    sleep(Duration::from_secs(4)).await;
-                };
-                let t2 = async {
-                    sleep(Duration::from_secs(1)).await;
-                };
-
-                let result;
-                futures::select_biased! {
-                    _ = t1.fuse() => result = Some(42),
-                    _ = t2.fuse() => result = Some(1234),
-                }
-
-                assert_eq!(result, Some(1234));
-            }
-        });
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_block_on_stuck_panics() {
-        let rt = Runtime::default();
-        rt.block_on(async {
-            // A future that never completes and has no timers
-            future::pending::<()>().await;
-        });
-    }
-
-    #[test]
-    fn test_multiple_spawned_tasks_timer_order() {
-        let rt = Runtime::default();
-        let completion_order = Arc::new(Mutex::new(VecDeque::new()));
-
-        rt.block_on(async {
-            let order_clone = completion_order.clone();
-            rt.spawn(Box::pin(async move {
-                sleep(Duration::from_millis(200)).await;
-                order_clone.lock().push_back(2);
-            }));
-
-            let order_clone = completion_order.clone();
-            rt.spawn(Box::pin(async move {
-                sleep(Duration::from_millis(100)).await;
-                order_clone.lock().push_back(1);
-            }));
-
-            let order_clone = completion_order.clone();
-            rt.spawn(Box::pin(async move {
-                sleep(Duration::from_millis(300)).await;
-                order_clone.lock().push_back(3);
-            }));
-
-            // Wait for all tasks to complete
-            sleep(Duration::from_secs(1)).await;
-        });
-
-        let guard = completion_order.lock();
-        assert_eq!(guard.len(), 3, "Not all tasks completed");
-        assert_eq!(guard[0], 1);
-        assert_eq!(guard[1], 2);
-        assert_eq!(guard[2], 3);
-    }
-
-    #[test]
-    fn test_nested_spawn() {
-        let rt = Runtime::default();
-        let inner_task_completed = Arc::new(AtomicBool::new(false));
-
-        rt.block_on(async {
-            let flag_clone = inner_task_completed.clone();
-            spawn(Box::pin(async move {
-                sleep(Duration::from_millis(50)).await;
-                spawn(Box::pin(async move {
-                    sleep(Duration::from_millis(50)).await;
-                    flag_clone.store(true, Ordering::SeqCst);
-                }));
-            }));
-
-            // Wait for inner task to complete
-            sleep(Duration::from_millis(101)).await;
-        });
-        assert!(
-            inner_task_completed.load(Ordering::SeqCst),
-            "Nested spawned task did not complete"
-        );
-    }
-
-    #[test]
-    fn test_many_tasks() {
-        const NUM_TASKS: usize = 1000;
-        let rt = Runtime::default();
-        let completed_count = Arc::new(AtomicUsize::new(0));
-
-        rt.block_on(async {
-            for i in 0..NUM_TASKS {
-                let count_clone = completed_count.clone();
-                rt.spawn(Box::pin(async move {
-                    // Vary sleep times slightly to mix things up
-                    sleep(Duration::from_millis(i as u64 % 100)).await;
-                    count_clone.fetch_add(1, Ordering::SeqCst);
-                }));
-            }
-
-            // Wait for everything to complete
-            sleep(Duration::from_secs(1234)).await;
-        });
-
-        assert_eq!(
-            completed_count.load(Ordering::SeqCst),
-            NUM_TASKS,
-            "Not all of the many tasks completed"
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "Spawned task panicked")]
-    fn test_spawned_task_panics() {
-        let rt = Runtime::default();
-        rt.block_on(async {
-            rt.spawn(Box::pin(async {
-                sleep(Duration::from_millis(10)).await;
-                panic!("Spawned task panicked");
-            }));
-
-            // Wait for the spawned task to execute
-            sleep(Duration::from_secs(42)).await;
-        });
-    }
-
-    #[test]
-    fn test_zero_duration_sleep() {
-        let rt = Runtime::default();
-        let task_completed = Arc::new(AtomicBool::new(false));
-        let flag_clone = task_completed.clone();
-
-        rt.block_on(async {
-            rt.spawn(Box::pin(async move {
-                sleep(Duration::from_secs(0)).await;
-                flag_clone.store(true, Ordering::SeqCst);
-            }));
-
-            // At least one await is necessary for the spawned future to run
-            sleep(Duration::from_nanos(1)).await;
-        });
-        assert!(
-            task_completed.load(Ordering::SeqCst),
-            "Task with zero duration sleep did not complete"
-        );
-    }
-
-    #[test]
-    fn test_main_future_completes_before_spawned_tasks() {
-        let rt = Runtime::default();
-        let done_tasks = Arc::new(Mutex::new(Vec::new()));
-
-        rt.block_on(async {
-            let done_tasks_clone = done_tasks.clone();
-            rt.spawn(Box::pin(async move {
-                // This task will take longer than the main future and won't be polled to completion
-                sleep(Duration::from_millis(200)).await;
-                done_tasks_clone.lock().push("inner");
-            }));
-
-            done_tasks.lock().push("main");
-        });
-
-        let done_tasks = done_tasks.lock();
-        assert_eq!(done_tasks[0], "main");
-        assert_eq!(done_tasks.len(), 1);
-    }
-
-    struct WakyTask {
-        wakes: Arc<AtomicUsize>,
-        max_wakes: usize,
-    }
-
-    impl Future for WakyTask {
-        type Output = ();
-
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            let current_wakes = self.wakes.fetch_add(1, Ordering::SeqCst);
-            if current_wakes >= self.max_wakes {
-                Poll::Ready(())
-            } else {
-                // Don't sleep on last iteration
-                if current_wakes < self.max_wakes - 1 {
-                    let waker = cx.waker().clone();
-
-                    // Wake this task up after a short delay, to ensure the task actually
-                    // goes to sleep
-                    spawn(async move {
-                        sleep(Duration::from_millis(10)).await;
-                        waker.wake();
-                    });
-                } else {
-                    cx.waker().wake_by_ref();
-                }
-
-                Poll::Pending
-            }
-        }
-    }
-
-    #[test]
-    fn test_task_repeatedly_wakes_itself() {
-        let rt = Runtime::default();
-        let wakes = Arc::new(AtomicUsize::new(0));
-        const MAX_WAKES: usize = 5;
-
-        rt.block_on(async {
-            spawn(WakyTask {
-                wakes: wakes.clone(),
-                max_wakes: MAX_WAKES,
-            });
-
-            // Wait for everything to complete
-            sleep(Duration::from_secs(42)).await;
-        });
-
-        assert_eq!(
-            wakes.load(Ordering::SeqCst),
-            MAX_WAKES + 1,
-            "Task was not polled the expected number of times"
-        );
     }
 }

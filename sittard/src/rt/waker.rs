@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::task::{RawWaker, RawWakerVTable, Waker};
 
 #[derive(Clone)]
-pub(super) struct TaskWaker {
+pub(crate) struct TaskWaker {
     task_id: u64,
     rt_event_queue: Arc<Mutex<Vec<WakeTask>>>,
 }

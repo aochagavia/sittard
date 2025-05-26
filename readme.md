@@ -3,7 +3,7 @@ Sittard
 
 A **S**ans-**I**O **t**ickless **a**sync **r**untime, fully **d**eterministic.
 
-That's a mouthful, so let's dissect it:
+That's a mouthful, so let's unpack it:
 
 - Async runtime: sittard runs async Rust code, i.e. stuff that implements the `Future` trait.
 - Sans-IO: sittard doesn't support asynchronous IO (e.g. network requests, filesystem operations,
@@ -55,8 +55,8 @@ internal clock through the `AdvanceClock` trait. Users can implement the trait i
 
 1. `AdvanceToNextWake`: when the runtime cannot make any progress (i.e. all futures are blocked), it
    advances to the exact moment upon which the next sleep elapses.
-2. `AdvanceToNextWakeWithResolution`: similar to `AdvanceToNextWake`, with the twist that the
-   virtual clock now has a user-specified resolution. The clock always advances in multiples of said
-   resolution.
+2. `AdvanceToNextWakeWithGranularity`: similar to `AdvanceToNextWake`, with the twist that the
+   virtual clock now has a user-specified granularity. The clock always advances in multiples of
+   said granularity.
 
 Another difference is that sittard supports sleeps of arbitrary amounts, whereas tokio's minimum sleep duration is of 1 millisecond.
