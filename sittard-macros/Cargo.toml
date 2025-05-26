@@ -2,6 +2,10 @@
 name = "sittard-macros"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Proc macros for the sittard crate"
+repository = "https://github.com/aochagavia/sittard"
+documentation = "https://docs.rs/sittard-macros"
 
 [lib]
 proc-macro = true

@@ -2,6 +2,10 @@
 name = "sittard"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Sans-IO tickless async runtime, fully deterministic"
+repository = "https://github.com/aochagavia/sittard"
+documentation = "https://docs.rs/sittard"
 
 [features]
 default = ["send"]
@@ -11,4 +15,4 @@ send = ["dep:send_wrapper"]
 futures.workspace = true
 parking_lot.workspace = true
 send_wrapper = { workspace = true, optional = true }
-sittard-macros = { path = "../sittard-macros" }
+sittard-macros = { version = "0.1.0", path = "../sittard-macros" }
