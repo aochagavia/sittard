@@ -1,7 +1,13 @@
+pub(crate) mod clock;
+pub(crate) mod task;
+mod waker;
+
+#[cfg(feature = "send")]
+pub(crate) mod send;
+
 use crate::time::Instant;
 use crate::time::timer::{PendingTimer, PendingTimerHandlerEnum, Timer};
-use futures::FutureExt;
-use futures::channel::oneshot::Canceled;
+use clock::{AdvanceClock, AdvanceToNextWake, RuntimeClock};
 use parking_lot::Mutex;
 use std::cell::{Cell, RefCell};
 use std::collections::{BinaryHeap, HashMap, VecDeque};
@@ -11,6 +17,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant as StdInstant};
+use task::{Task, WakeTask};
 
 thread_local! {
     static ACTIVE_RT: RefCell<Option<Runtime >> = const { RefCell::new(None) };
@@ -316,142 +323,6 @@ impl Runtime {
     }
 }
 
-struct WakeTask {
-    task_id: u64,
-}
-
-#[derive(Clone)]
-pub(crate) struct RuntimeClock {
-    pub(crate) now: Arc<Mutex<StdInstant>>,
-}
-
-impl RuntimeClock {
-    pub(crate) fn now(&self) -> StdInstant {
-        *self.now.lock()
-    }
-
-    pub(crate) fn set_now(&self, now: StdInstant) {
-        *self.now.lock() = now;
-    }
-}
-
-pub struct JoinHandle<T> {
-    pub(crate) rx: futures::channel::oneshot::Receiver<T>,
-}
-
-impl<T> Future for JoinHandle<T> {
-    type Output = Result<T, Canceled>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.rx.poll_unpin(cx)
-    }
-}
-
-mod waker {
-    use super::*;
-    use std::task::{RawWaker, RawWakerVTable};
-
-    #[derive(Clone)]
-    pub(super) struct TaskWaker {
-        task_id: u64,
-        rt_event_queue: Arc<Mutex<Vec<WakeTask>>>,
-    }
-
-    impl TaskWaker {
-        pub(super) fn new(rt_event_queue: Arc<Mutex<Vec<WakeTask>>>, task_id: u64) -> Self {
-            Self {
-                rt_event_queue,
-                task_id,
-            }
-        }
-
-        fn wake(self: Arc<Self>) {
-            self.rt_event_queue.lock().push(WakeTask {
-                task_id: self.task_id,
-            });
-        }
-
-        pub(super) fn task_id(&self) -> u64 {
-            self.task_id
-        }
-
-        pub(super) fn into_waker(self: Arc<Self>) -> Waker {
-            unsafe { Waker::from_raw(RawWaker::new(Arc::into_raw(self) as _, &VTABLE)) }
-        }
-    }
-
-    pub(crate) static VTABLE: RawWakerVTable = RawWakerVTable::new(
-        // Clone
-        |data| {
-            let arc: Arc<TaskWaker> = unsafe { Arc::from_raw(data as _) };
-            let cloned = arc.clone();
-            std::mem::forget(arc);
-
-            RawWaker::new(Arc::into_raw(cloned) as _, &VTABLE)
-        },
-        // Wake
-        |data| {
-            let arc: Arc<TaskWaker> = unsafe { Arc::from_raw(data as _) };
-            arc.wake();
-        },
-        // Wake by ref
-        |data| {
-            let arc: Arc<TaskWaker> = unsafe { Arc::from_raw(data as _) };
-            let cloned = arc.clone();
-            std::mem::forget(arc);
-
-            cloned.wake();
-        },
-        // Drop
-        |data| {
-            let _arc: Arc<TaskWaker> = unsafe { Arc::from_raw(data as _) };
-        },
-    );
-}
-
-pub(crate) struct Task {
-    future: Pin<Box<dyn Future<Output = ()>>>,
-}
-
-pub trait AdvanceClock {
-    fn advance_clock(&self, now: StdInstant, next_timer_elapsed: StdInstant) -> StdInstant;
-}
-
-pub struct AdvanceToNextWake;
-
-impl AdvanceClock for AdvanceToNextWake {
-    fn advance_clock(&self, _now: StdInstant, next_timer_elapsed: StdInstant) -> StdInstant {
-        next_timer_elapsed
-    }
-}
-
-pub struct AdvanceToNextWakeWithResolution {
-    pub(crate) last_time_jump_to: Mutex<Option<std::time::Instant>>,
-    pub(crate) timer_granularity: Duration,
-}
-
-impl AdvanceToNextWakeWithResolution {
-    pub fn new(timer_granularity: Duration) -> Self {
-        Self {
-            last_time_jump_to: Mutex::default(),
-            timer_granularity,
-        }
-    }
-}
-
-impl AdvanceClock for AdvanceToNextWakeWithResolution {
-    fn advance_clock(&self, now: StdInstant, next_timer_elapsed: StdInstant) -> StdInstant {
-        // Advance an exact multiple of `timer_granularity` since the last time jump
-        let last_time_jump = self.last_time_jump_to.lock().unwrap_or(now);
-        let diff = next_timer_elapsed - last_time_jump;
-        let elapsed_intervals =
-            (self.timer_granularity.as_secs_f64() / diff.as_secs_f64()).ceil() as u32;
-        let new_time = now + self.timer_granularity * elapsed_intervals;
-        *self.last_time_jump_to.lock() = Some(new_time);
-        new_time
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -459,7 +330,7 @@ mod test {
     use crate::spawn;
     use crate::test_util::assert_send;
     use crate::time::{sleep, timeout};
-    use futures::{SinkExt, StreamExt};
+    use futures::{FutureExt, SinkExt, StreamExt};
     use parking_lot::Mutex;
     use std::collections::VecDeque;
     use std::future::{self, Future};

@@ -1,4 +1,5 @@
-use crate::rt::{RuntimeClock, RuntimeInner};
+use crate::rt::RuntimeInner;
+use crate::rt::clock::RuntimeClock;
 use parking_lot::Mutex;
 use std::cmp::Ordering;
 use std::fmt::{Debug, Formatter};

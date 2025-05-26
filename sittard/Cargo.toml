@@ -3,7 +3,12 @@ name = "sittard"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["send"]
+send = ["dep:send_wrapper"]
+
 [dependencies]
 futures.workspace = true
 parking_lot.workspace = true
+send_wrapper = { workspace = true, optional = true }
 sittard-macros = { path = "../sittard-macros" }

@@ -8,7 +8,14 @@ mod rt;
 mod test_util;
 pub mod time;
 
-pub use rt::{Runtime, JoinHandle, AdvanceClock, AdvanceToNextWake, AdvanceToNextWakeWithResolution};
+pub use rt::Runtime;
+pub use rt::clock::AdvanceClock;
+pub use rt::clock::AdvanceToNextWake;
+pub use rt::clock::AdvanceToNextWakeWithResolution;
+pub use rt::task::JoinHandle;
+
+#[cfg(feature = "send")]
+pub use rt::send::SendRuntime;
 
 pub fn spawn<T: 'static>(f: impl Future<Output = T> + 'static) -> JoinHandle<T> {
     let rt = Runtime::active();

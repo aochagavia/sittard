@@ -10,4 +10,5 @@ debug = true
 futures = { version = "0.3.31", default-features = false, features = ["alloc", "std", "async-await"] }
 parking_lot = "0.12.3"
 quote = "1.0.40"
+send_wrapper = "0.6.0"
 syn = {version = "2.0.101", features = ["full"]}
