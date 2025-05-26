@@ -3,12 +3,12 @@ use crate::time::timer::{PendingTimer, PendingTimerHandlerEnum, Timer};
 use futures::FutureExt;
 use futures::channel::oneshot::Canceled;
 use parking_lot::Mutex;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::pin::{Pin, pin};
-use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, atomic};
+use std::rc::Rc;
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant as StdInstant};
 
@@ -18,25 +18,29 @@ thread_local! {
 
 #[derive(Clone)]
 pub struct Rt {
-    inner: Arc<RtInner>,
+    inner: Rc<RtInner>,
 }
 
 pub(crate) struct RtInner {
     // Time-keeping
-    pub(crate) now: Mutex<std::time::Instant>,
+    pub(crate) clock: RuntimeClock,
     pub(crate) advance_clock: Box<dyn AdvanceClock>,
 
     // Scheduling
-    pub(crate) next_task_id: AtomicU64,
-    pub(crate) ready_to_poll_tasks: Mutex<VecDeque<Task>>,
-    pub(crate) pending_timers: Mutex<BinaryHeap<Arc<PendingTimer>>>,
-    pub(crate) wakers_by_timer_id: Mutex<HashMap<u64, Vec<Waker>>>,
-    pub(crate) blocked_tasks: Mutex<HashMap<u64, Task>>,
+    next_task_id: Cell<u64>,
+    task_wakes_since_last_advance_clock: Arc<Mutex<Vec<WakeTask>>>,
+    pub(crate) pending_timers_since_last_advance_clock: Arc<Mutex<Vec<Arc<PendingTimer>>>>,
+    ready_to_poll_tasks: RefCell<VecDeque<Task>>,
+    pending_timers: RefCell<BinaryHeap<Arc<PendingTimer>>>,
+    wakers_by_timer_id: RefCell<HashMap<u64, Vec<Waker>>>,
+    blocked_tasks_by_id: RefCell<HashMap<u64, Task>>,
 }
 
 impl RtInner {
     pub(crate) fn get_next_id(&self) -> u64 {
-        self.next_task_id.fetch_add(1, atomic::Ordering::SeqCst)
+        let next_id = self.next_task_id.get();
+        self.next_task_id.set(next_id + 1);
+        next_id
     }
 }
 
@@ -56,35 +60,39 @@ impl Rt {
     pub fn new(advance_clock: Box<dyn AdvanceClock>) -> Self {
         let now = StdInstant::now();
         Self {
-            inner: Arc::new(RtInner {
-                now: Mutex::new(now),
+            inner: Rc::new(RtInner {
+                clock: RuntimeClock {
+                    now: Arc::new(Mutex::new(now)),
+                },
                 advance_clock,
                 next_task_id: Default::default(),
+                task_wakes_since_last_advance_clock: Arc::default(),
+                pending_timers_since_last_advance_clock: Arc::default(),
                 ready_to_poll_tasks: Default::default(),
                 pending_timers: Default::default(),
                 wakers_by_timer_id: Default::default(),
-                blocked_tasks: Default::default(),
+                blocked_tasks_by_id: Default::default(),
             }),
         }
     }
 
     pub fn new_timer(&self, deadline: StdInstant) -> Timer {
-        Timer::new(self.inner.clone(), deadline)
+        Timer::new(&self.inner, deadline)
     }
 
-    pub fn spawn<T: Future<Output = ()> + Send + 'static>(&self, future: T) {
+    pub fn spawn<T: Future<Output = ()> + 'static>(&self, future: T) {
         self.spawn_boxed(Box::pin(future))
     }
 
-    pub fn spawn_boxed(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
+    pub fn spawn_boxed(&self, future: Pin<Box<dyn Future<Output = ()> + 'static>>) {
         self.inner
             .ready_to_poll_tasks
-            .lock()
+            .borrow_mut()
             .push_back(Task { future });
     }
 
     pub fn now(&self) -> std::time::Instant {
-        *self.inner.now.lock()
+        self.inner.clock.now()
     }
 
     pub fn active() -> Rt {
@@ -120,44 +128,23 @@ impl Rt {
 
         let mut f = pin!(f);
         let ready = loop {
-            // Poll any tasks that are ready
-            loop {
-                let Some(mut task) = self.inner.ready_to_poll_tasks.lock().pop_front() else {
-                    break;
-                };
+            self.wake_tasks_since_last_advance_clock();
+            self.poll_tasks_until_all_blocked();
+            self.wake_tasks_since_last_advance_clock();
 
-                // Poll the next task in the queue
-                let task_id = self.inner.get_next_id();
-                let waker = Arc::new(waker::TaskWaker::new(self.inner.clone(), task_id));
-                let cx_waker = waker.clone().into_waker();
-                let mut cx = Context::from_waker(&cx_waker);
-                match task.future.as_mut().poll(&mut cx) {
-                    Poll::Ready(()) => {
-                        // Task is done, nothing else to do
-                    }
-                    Poll::Pending => {
-                        if waker.woken() {
-                            // Task is pending, but it was woken while polling
-                            self.inner.ready_to_poll_tasks.lock().push_back(task);
-                        } else {
-                            // Task is pending and is waiting to be woken
-                            self.inner.blocked_tasks.lock().insert(task_id, task);
-                        }
-                    }
-                }
-            }
-
-            // We are polling the main task on every loop iteration, so we don't need to use a real
-            // waker
+            // Poll the main task. Note: we poll on every loop iteration, so we don't need to use a
+            // real waker.
             let mut cx = Context::from_waker(Waker::noop());
             if let Poll::Ready(value) = f.as_mut().poll(&mut cx) {
                 // We are done as soon as the main task is ready
                 break value;
             }
 
-            if self.inner.ready_to_poll_tasks.lock().is_empty() {
-                // There are no ready-to-poll tasks at this point, so let's advance the time
-                self.advance_time();
+            self.set_timer_wakers_since_last_advance_clock();
+
+            // Advance the clock only when there are no ready-to-poll tasks
+            if self.inner.ready_to_poll_tasks.borrow().is_empty() {
+                self.advance_clock();
             }
         };
 
@@ -165,10 +152,77 @@ impl Rt {
         ready
     }
 
-    fn advance_time(&self) {
+    fn wake_tasks_since_last_advance_clock(&self) {
+        let mut task_wakes = self.inner.task_wakes_since_last_advance_clock.lock();
+        for wake in task_wakes.drain(..) {
+            let Some(blocked) = self
+                .inner
+                .blocked_tasks_by_id
+                .borrow_mut()
+                .remove(&wake.task_id)
+            else {
+                // Already woken, nothing to do here
+                continue;
+            };
+
+            self.inner
+                .ready_to_poll_tasks
+                .borrow_mut()
+                .push_back(blocked);
+        }
+    }
+
+    fn poll_tasks_until_all_blocked(&self) {
         loop {
-            let blocked_tasks = self.inner.blocked_tasks.lock().len();
-            let timer = match self.inner.pending_timers.lock().pop() {
+            let Some(mut task) = self.inner.ready_to_poll_tasks.borrow_mut().pop_front() else {
+                break;
+            };
+
+            // Poll the next task in the queue
+            let task_id = self.inner.get_next_id();
+            let waker = Arc::new(waker::TaskWaker::new(
+                self.inner.task_wakes_since_last_advance_clock.clone(),
+                task_id,
+            ));
+            let cx_waker = waker.clone().into_waker();
+            let mut cx = Context::from_waker(&cx_waker);
+            match task.future.as_mut().poll(&mut cx) {
+                Poll::Ready(()) => {
+                    // Task is done, nothing else to do
+                }
+                Poll::Pending => {
+                    // Task is pending and is waiting to be woken
+                    self.inner
+                        .blocked_tasks_by_id
+                        .borrow_mut()
+                        .insert(task_id, task);
+                }
+            }
+        }
+    }
+
+    fn set_timer_wakers_since_last_advance_clock(&self) {
+        for pending in self
+            .inner
+            .pending_timers_since_last_advance_clock
+            .lock()
+            .drain(..)
+        {
+            self.inner
+                .wakers_by_timer_id
+                .borrow_mut()
+                .entry(pending.timer_id)
+                .or_default()
+                .push(pending.waker.clone());
+
+            self.inner.pending_timers.borrow_mut().push(pending);
+        }
+    }
+
+    fn advance_clock(&self) {
+        loop {
+            let blocked_tasks = self.inner.blocked_tasks_by_id.borrow().len();
+            let timer = match self.inner.pending_timers.borrow_mut().pop() {
                 // There's a pending timer, so we can advance!
                 Some(timer) => timer,
                 // No pending timers, so advancing time won't let us make progress
@@ -184,9 +238,9 @@ impl Rt {
                 let next_timer_ready = self
                     .inner
                     .pending_timers
-                    .lock()
+                    .borrow()
                     .peek()
-                    .is_some_and(|t| t.elapsed_at <= *self.inner.now.lock());
+                    .is_some_and(|t| t.elapsed_at <= self.inner.clock.now());
                 if !next_timer_ready {
                     break;
                 }
@@ -198,7 +252,7 @@ impl Rt {
         match timer.handler.as_enum() {
             PendingTimerHandlerEnum::WakeWaitingTasks => {
                 // Advance the timer if necessary
-                let now = *self.inner.now.lock();
+                let now = self.inner.clock.now();
                 if now < timer.elapsed_at {
                     let new_time = self
                         .inner
@@ -210,14 +264,14 @@ impl Rt {
                         );
                     }
 
-                    *self.inner.now.lock() = new_time;
+                    self.inner.clock.set_now(new_time);
                 }
 
                 // Wake all waiting tasks
                 let wakers = self
                     .inner
                     .wakers_by_timer_id
-                    .lock()
+                    .borrow_mut()
                     .remove(&timer.timer_id)
                     .unwrap_or_default();
                 for waker in wakers {
@@ -235,7 +289,7 @@ impl Rt {
                 let wakers = self
                     .inner
                     .wakers_by_timer_id
-                    .lock()
+                    .borrow_mut()
                     .remove(&timer.timer_id)
                     .unwrap_or_default();
 
@@ -252,13 +306,32 @@ impl Rt {
                     std::mem::forget(waker);
 
                     // Remove blocked task
-                    self.inner.blocked_tasks.lock().remove(&task_id);
+                    self.inner.blocked_tasks_by_id.borrow_mut().remove(&task_id);
                 }
 
                 // No tasks unblocked, only cancelled
                 false
             }
         }
+    }
+}
+
+struct WakeTask {
+    task_id: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeClock {
+    pub(crate) now: Arc<Mutex<StdInstant>>,
+}
+
+impl RuntimeClock {
+    pub(crate) fn now(&self) -> StdInstant {
+        *self.now.lock()
+    }
+
+    pub(crate) fn set_now(&self, now: StdInstant) {
+        *self.now.lock() = now;
     }
 }
 
@@ -274,59 +347,40 @@ impl<T> Future for JoinHandle<T> {
     }
 }
 
-pub(crate) mod waker {
+mod waker {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{RawWaker, RawWakerVTable};
 
     #[derive(Clone)]
-    pub struct TaskWaker {
+    pub(super) struct TaskWaker {
         task_id: u64,
-        rt: Arc<RtInner>,
-        woken: Arc<AtomicBool>,
+        rt_event_queue: Arc<Mutex<Vec<WakeTask>>>,
     }
 
     impl TaskWaker {
-        pub fn new(rt: Arc<RtInner>, task_id: u64) -> Self {
+        pub(super) fn new(rt_event_queue: Arc<Mutex<Vec<WakeTask>>>, task_id: u64) -> Self {
             Self {
-                rt,
+                rt_event_queue,
                 task_id,
-                woken: Arc::new(false.into()),
             }
         }
 
         fn wake(self: Arc<Self>) {
-            self.woken.store(true, Ordering::SeqCst);
-
-            let Some(blocked) = self.rt.blocked_tasks.lock().remove(&self.task_id) else {
-                // Already woken, nothing to do here
-                return;
-            };
-
-            self.rt.ready_to_poll_tasks.lock().push_back(blocked);
+            self.rt_event_queue.lock().push(WakeTask {
+                task_id: self.task_id,
+            });
         }
 
-        pub fn woken(&self) -> bool {
-            self.woken.load(Ordering::SeqCst)
-        }
-
-        pub fn task_id(&self) -> u64 {
+        pub(super) fn task_id(&self) -> u64 {
             self.task_id
         }
 
-        pub fn into_waker(self: Arc<Self>) -> Waker {
+        pub(super) fn into_waker(self: Arc<Self>) -> Waker {
             unsafe { Waker::from_raw(RawWaker::new(Arc::into_raw(self) as _, &VTABLE)) }
         }
     }
 
-    impl Drop for TaskWaker {
-        fn drop(&mut self) {
-            // The task will never be woken, so let's garbage-collect it
-            self.rt.blocked_tasks.lock().remove(&self.task_id);
-        }
-    }
-
-    pub static VTABLE: RawWakerVTable = RawWakerVTable::new(
+    pub(crate) static VTABLE: RawWakerVTable = RawWakerVTable::new(
         // Clone
         |data| {
             let arc: Arc<TaskWaker> = unsafe { Arc::from_raw(data as _) };
@@ -356,10 +410,10 @@ pub(crate) mod waker {
 }
 
 pub(crate) struct Task {
-    future: Pin<Box<dyn Future<Output = ()> + Send>>,
+    future: Pin<Box<dyn Future<Output = ()>>>,
 }
 
-pub trait AdvanceClock: Send + Sync {
+pub trait AdvanceClock {
     fn advance_clock(&self, now: StdInstant, next_timer_elapsed: StdInstant) -> StdInstant;
 }
 
@@ -401,6 +455,9 @@ impl AdvanceClock for AdvanceToNextWakeWithResolution {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::rt::waker::TaskWaker;
+    use crate::spawn;
+    use crate::test_util::assert_send;
     use crate::time::{sleep, timeout};
     use futures::{SinkExt, StreamExt};
     use parking_lot::Mutex;
@@ -412,12 +469,16 @@ mod test {
     use std::time::Duration;
 
     #[test]
+    fn test_waker_is_send() {
+        assert_send::<TaskWaker>();
+    }
+
+    #[test]
     fn test_waiting_timers_ordered_correctly() {
         let rt = Rt::default();
         rt.block_on(async {
-            let rt_cp = rt.clone();
             rt.spawn(Box::pin(async move {
-                rt_cp.sleep(Duration::from_secs(5)).await;
+                sleep(Duration::from_secs(5)).await;
             }));
 
             let now = rt.now();
@@ -552,11 +613,10 @@ mod test {
         let inner_task_completed = Arc::new(AtomicBool::new(false));
 
         rt.block_on(async {
-            let rt_clone = rt.clone();
             let flag_clone = inner_task_completed.clone();
-            rt.spawn(Box::pin(async move {
+            spawn(Box::pin(async move {
                 sleep(Duration::from_millis(50)).await;
-                rt_clone.spawn(Box::pin(async move {
+                spawn(Box::pin(async move {
                     sleep(Duration::from_millis(50)).await;
                     flag_clone.store(true, Ordering::SeqCst);
                 }));
@@ -579,11 +639,10 @@ mod test {
 
         rt.block_on(async {
             for i in 0..NUM_TASKS {
-                let rt_clone = rt.clone();
                 let count_clone = completed_count.clone();
                 rt.spawn(Box::pin(async move {
                     // Vary sleep times slightly to mix things up
-                    rt_clone.sleep(Duration::from_millis(i as u64 % 100)).await;
+                    sleep(Duration::from_millis(i as u64 % 100)).await;
                     count_clone.fetch_add(1, Ordering::SeqCst);
                 }));
             }
@@ -621,9 +680,8 @@ mod test {
         let flag_clone = task_completed.clone();
 
         rt.block_on(async {
-            let rt_clone = rt.clone();
             rt.spawn(Box::pin(async move {
-                rt_clone.sleep(Duration::from_secs(0)).await;
+                sleep(Duration::from_secs(0)).await;
                 flag_clone.store(true, Ordering::SeqCst);
             }));
 
@@ -642,11 +700,10 @@ mod test {
         let done_tasks = Arc::new(Mutex::new(Vec::new()));
 
         rt.block_on(async {
-            let rt_clone = rt.clone();
             let done_tasks_clone = done_tasks.clone();
             rt.spawn(Box::pin(async move {
                 // This task will take longer than the main future and won't be polled to completion
-                rt_clone.sleep(Duration::from_millis(200)).await;
+                sleep(Duration::from_millis(200)).await;
                 done_tasks_clone.lock().push("inner");
             }));
 
@@ -661,7 +718,6 @@ mod test {
     struct WakyTask {
         wakes: Arc<AtomicUsize>,
         max_wakes: usize,
-        rt: Rt,
     }
 
     impl Future for WakyTask {
@@ -675,14 +731,13 @@ mod test {
                 // Don't sleep on last iteration
                 if current_wakes < self.max_wakes - 1 {
                     let waker = cx.waker().clone();
-                    let rt = self.rt.clone();
 
                     // Wake this task up after a short delay, to ensure the task actually
                     // goes to sleep
-                    self.rt.spawn(Box::pin(async move {
-                        rt.sleep(Duration::from_millis(10)).await;
+                    spawn(async move {
+                        sleep(Duration::from_millis(10)).await;
                         waker.wake();
-                    }));
+                    });
                 } else {
                     cx.waker().wake_by_ref();
                 }
@@ -699,13 +754,10 @@ mod test {
         const MAX_WAKES: usize = 5;
 
         rt.block_on(async {
-            let rt_clone = rt.clone();
-            let wakes = wakes.clone();
-            rt.spawn(Box::pin(WakyTask {
-                wakes,
+            spawn(WakyTask {
+                wakes: wakes.clone(),
                 max_wakes: MAX_WAKES,
-                rt: rt_clone,
-            }));
+            });
 
             // Wait for everything to complete
             sleep(Duration::from_secs(42)).await;

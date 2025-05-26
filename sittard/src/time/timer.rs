@@ -1,25 +1,27 @@
-use crate::rt::RtInner;
+use crate::rt::{RtInner, RuntimeClock};
 use parking_lot::Mutex;
 use std::cmp::Ordering;
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::Instant as StdInstant;
 
 pub struct Timer {
     id: u64,
-    rt: Arc<RtInner>,
+    clock: RuntimeClock,
+    new_pending_timers_queue: Arc<Mutex<Vec<Arc<PendingTimer>>>>,
     deadline: StdInstant,
     currently_pending: Mutex<Option<Arc<PendingTimer>>>,
 }
 
 impl Timer {
-    pub(crate) fn new(rt: Arc<RtInner>, deadline: StdInstant) -> Self {
+    pub(crate) fn new(rt: &RtInner, deadline: StdInstant) -> Self {
         Self {
             id: rt.get_next_id(),
-            rt,
+            clock: rt.clock.clone(),
+            new_pending_timers_queue: rt.pending_timers_since_last_advance_clock.clone(),
             deadline,
             currently_pending: Mutex::default(),
         }
@@ -30,19 +32,21 @@ impl Timer {
     pub fn reset(mut self: Pin<&mut Self>, deadline: StdInstant) {
         // Update timer
         self.deadline = deadline;
-        let pending = Arc::new(PendingTimer {
-            timer_id: self.id,
-            elapsed_at: self.deadline,
-            handler: PendingTimerHandler::wake_waiting_tasks(),
-        });
-        let previously_pending = self.currently_pending.lock().replace(pending.clone());
 
-        // Enqueue pending timer, so we get woken once we reach the deadline
-        self.rt.pending_timers.lock().push(pending.clone());
+        // Update any existing pending timer
+        if let Some(previously_pending) = self.currently_pending.lock().take() {
+            let pending = Arc::new(PendingTimer {
+                timer_id: self.id,
+                elapsed_at: self.deadline,
+                handler: PendingTimerHandler::wake_waiting_tasks(),
+                waker: previously_pending.waker.clone(),
+            });
 
-        // Mark the previously pending timer as ignored, since it no longer should wake anything
-        if let Some(previously_pending) = previously_pending {
+            // Mark the previously pending timer as ignored, since it no longer should wake anything
             previously_pending.handler.set_ignore();
+
+            // Enqueue new pending timer, so we get woken once we reach the deadline
+            self.new_pending_timers_queue.lock().push(pending.clone());
         }
     }
 }
@@ -51,23 +55,19 @@ impl Future for Timer {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if *self.rt.now.lock() >= self.deadline {
+        if self.clock.now() >= self.deadline {
             Poll::Ready(())
         } else {
             let pending = Arc::new(PendingTimer {
                 timer_id: self.id,
                 elapsed_at: self.deadline,
                 handler: PendingTimerHandler::wake_waiting_tasks(),
+                waker: cx.waker().clone(),
             });
             *self.currently_pending.lock() = Some(pending.clone());
-            self.rt.pending_timers.lock().push(pending);
 
-            self.rt
-                .wakers_by_timer_id
-                .lock()
-                .entry(self.id)
-                .or_default()
-                .push(cx.waker().clone());
+            // Enqueue pending timer, so we get woken once we reach the deadline
+            self.new_pending_timers_queue.lock().push(pending.clone());
             Poll::Pending
         }
     }
@@ -122,6 +122,7 @@ pub struct PendingTimer {
     pub(crate) timer_id: u64,
     pub(crate) elapsed_at: StdInstant,
     pub(crate) handler: PendingTimerHandler,
+    pub(crate) waker: Waker,
 }
 
 impl Eq for PendingTimer {}
@@ -147,10 +148,16 @@ impl Ord for PendingTimer {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::test_util::assert_send;
     use crate::time::instant::Instant;
     use crate::time::sleep;
     use std::task::ready;
     use std::time::Duration;
+
+    #[test]
+    fn test_timer_is_send() {
+        assert_send::<Timer>();
+    }
 
     #[test]
     fn test_pending_timer_ord_descending() {
@@ -159,11 +166,13 @@ mod test {
             timer_id: 0,
             elapsed_at: now,
             handler: PendingTimerHandler::wake_waiting_tasks(),
+            waker: Waker::noop().clone(),
         };
         let timer2 = PendingTimer {
             timer_id: 1,
             elapsed_at: now + Duration::from_secs(5),
             handler: PendingTimerHandler::wake_waiting_tasks(),
+            waker: Waker::noop().clone(),
         };
 
         assert!(timer1 > timer2);
